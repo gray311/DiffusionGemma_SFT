@@ -24,7 +24,7 @@ python train_diffusiongemma_sft.py \
   --lora_linears ${LINEARS:-official} \
   --max_examples ${MAXEX:-0} --max_images ${MAXIMG:-0} \
   --router_aux_loss_coef ${AUXCOEF:-0} \
-  --self_cond_prob ${SELFCOND:-0.5} --ar_loss ${ARLOSS:-True} \
+  --self_cond_prob ${SELFCOND:-0.5} --ar_loss ${ARLOSS:-True} --ar_loss_weight ${ARW:-1.0} \
   --device_map "$DMAP" --mp_cap_gib ${MPCAP:-0} --attn_implementation ${ATTN:-sdpa} \
   --output_dir "$OUT" \
   --num_train_epochs ${EPOCHS:-3} \

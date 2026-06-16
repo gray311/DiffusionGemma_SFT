@@ -69,6 +69,7 @@ class ScriptArgs:
     eps_t: float = 1e-3               # min corruption ratio
     self_cond_prob: float = 0.5       # self-conditioning probability (official: 0.5)
     ar_loss: bool = True              # encoder autoregressive co-loss (official: on)
+    ar_loss_weight: float = 1.0       # weight on the AR co-loss (official: 1.0)
     # LoRA (our MoE-expert mounting, kept)
     use_lora: bool = True
     lora_r: int = 16
@@ -104,51 +105,59 @@ def _resolve_image(p, path_from, path_to):
 
 
 def _to_messages(ex, data_format, path_from, path_to, max_images=0):
-    """Return (messages, image_paths). Last message is the assistant response."""
+    """Return (messages, image_paths). messages is the FULL turn structure as a
+    list of {"role", "content": str} (text only; <image> markers stripped, images
+    attached to the first user turn at render time). The final message must be the
+    assistant turn we supervise."""
     fix = lambda p: _resolve_image(p, path_from, path_to)
     cap = lambda lst: lst[:max_images] if max_images > 0 else lst
+    strip = lambda s: s.replace("<image>", "").strip()
     if data_format == "auto":
         data_format = ("messages" if "messages" in ex
                        else "conversations" if "conversations" in ex else "qa")
+    imgs = cap([fix(p) for p in ex.get("image", []) or []])
     if data_format == "qa":
-        imgs = cap([fix(p) for p in ex.get("image", []) or []])
-        qtext = ex["question"].replace("<image>", "").strip()
-        answer = ex["answer"]
+        messages = [{"role": "user", "content": strip(ex["question"])},
+                    {"role": "assistant", "content": ex["answer"]}]
     elif data_format == "conversations":
-        imgs = cap([fix(p) for p in ex.get("image", []) or []])
-        conv = ex["conversations"]
-        # use the prompt up to (and including) the final assistant/gpt turn
-        last_gpt = max(i for i, m in enumerate(conv) if m["from"] in ("gpt", "assistant"))
-        user_text = "\n".join(m["value"] for m in conv[:last_gpt] if m["from"] in ("human", "user"))
-        qtext = user_text.replace("<image>", "").strip()
-        answer = conv[last_gpt]["value"]
+        role = {"human": "user", "user": "user", "system": "system",
+                "gpt": "assistant", "assistant": "assistant"}
+        messages = [{"role": role.get(m["from"], m["from"]), "content": strip(m["value"])}
+                    for m in ex["conversations"]]
     elif data_format == "messages":
-        imgs = cap([fix(p) for p in ex.get("image", []) or []])
-        msgs = ex["messages"]
-        assert msgs[-1]["role"] == "assistant", "last message must be assistant"
-        qtext = "\n".join(m["content"] for m in msgs[:-1]
-                          if m["role"] in ("user", "system") and isinstance(m["content"], str))
-        qtext = qtext.replace("<image>", "").strip()
-        answer = msgs[-1]["content"]
+        messages = [{"role": m["role"], "content": strip(m["content"])
+                     if isinstance(m["content"], str) else m["content"]}
+                    for m in ex["messages"]]
     else:
         raise ValueError(f"unknown data_format {data_format}")
-
-    if imgs:
-        content = [{"type": "image", "image": p} for p in imgs] + [{"type": "text", "text": qtext}]
-    else:
-        content = qtext
-    messages = [{"role": "user", "content": content}, {"role": "assistant", "content": answer}]
-    return messages, imgs
+    # keep up to and including the last assistant turn (later turns, if any, drop)
+    last = max(i for i, m in enumerate(messages) if m["role"] == "assistant")
+    return messages[: last + 1], imgs
 
 
-def _text_only(messages):
-    """Replace image content dicts with a single <image> placeholder per image."""
-    out = []
+def _last_span(masks):
+    """(span_len, tail_offset) of the LAST contiguous run of 1s in the assistant
+    mask; tail_offset = #tokens after the span end. Supervises only the final
+    assistant turn (matches the official 'final assistant turn only')."""
+    if not any(masks):
+        return 0, 0
+    end = max(i for i, m in enumerate(masks) if m)
+    start = end
+    while start - 1 >= 0 and masks[start - 1]:
+        start -= 1
+    return end - start + 1, len(masks) - 1 - end
+
+
+def _attach_images(messages, image_objs):
+    """Attach all images to the FIRST user turn as content parts."""
+    out, done = [], False
     for m in messages:
-        c = m["content"]
-        if isinstance(c, list):
-            c = "".join("<image>" if it.get("type") == "image" else it.get("text", "") for it in c)
-        out.append({"role": m["role"], "content": c})
+        if m["role"] == "user" and not done and image_objs:
+            m = {"role": "user",
+                 "content": [{"type": "image", "image": im} for im in image_objs]
+                            + [{"type": "text", "text": m["content"]}]}
+            done = True
+        out.append(m)
     return out
 
 
@@ -163,30 +172,33 @@ class SFTDataset(Dataset):
         self.sa = sa
         self.train_template = open(TRAIN_TEMPLATE_PATH).read()
 
-        # Precompute the supervised-span length and an estimated full sequence
-        # length, then DROP examples that (a) have no supervised span or (b) don't
-        # fit in max_length. We must not silently right-truncate: the answer is
-        # the suffix, so truncation would delete the labels and train an all-EOS
-        # canvas. (Images are in the user turn, so the assistant-suffix length is
-        # unaffected by image expansion; real seq = text_tokens + n_img*(img_tok-1).)
+        # Precompute the LAST assistant span (span_len, tail_offset) and an estimated
+        # full sequence length, then DROP examples with no supervised span or that
+        # don't fit in max_length. We must not silently right-truncate: the answer
+        # is the suffix, so truncation would delete the labels and train an all-EOS
+        # canvas. Images sit in the (first) user turn, so the span offsets-from-end
+        # are unaffected by image expansion; real seq ~ text_tokens + n_img*img_tok.
         self.items = []
         n_nospan = n_long = 0
         for ex in raw:
             messages, img_paths = _to_messages(ex, sa.data_format, sa.image_path_from,
                                                sa.image_path_to, sa.max_images)
+            if not sa.multimodal:
+                img_paths = []   # --multimodal False -> text-only, ignore images
             o = self.tok.apply_chat_template(
-                _text_only(messages), chat_template=self.train_template, tokenize=True,
+                messages, chat_template=self.train_template, tokenize=True,
                 return_assistant_tokens_mask=True, return_dict=True,
             )
-            n_sup = int(sum(o["assistant_masks"]))
-            est_seq = len(o["input_ids"]) + len(img_paths) * (sa.image_seq_tokens - 1)
-            if n_sup == 0:
+            span_len, tail = _last_span(o["assistant_masks"])
+            est_seq = len(o["input_ids"]) + len(img_paths) * sa.image_seq_tokens
+            if span_len == 0:
                 n_nospan += 1
                 continue
             if est_seq > sa.max_length:
                 n_long += 1
                 continue
-            self.items.append({"messages": messages, "img_paths": img_paths, "n_sup": n_sup})
+            self.items.append({"messages": messages, "img_paths": img_paths,
+                               "span_len": span_len, "tail": tail})
         print(f"SFTDataset: kept {len(self.items)}/{len(raw)}  "
               f"dropped no-span={n_nospan}  dropped >max_length({sa.max_length})={n_long}", flush=True)
 
@@ -195,14 +207,12 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, i):
         it = self.items[i]
-        messages, img_paths, n_sup = it["messages"], it["img_paths"], it["n_sup"]
+        messages, img_paths = it["messages"], it["img_paths"]
+        span_len, tail = it["span_len"], it["tail"]
         if img_paths:
             from PIL import Image
             imgs = [Image.open(p).convert("RGB") for p in img_paths]
-            content = [{"type": "image", "image": im} for im in imgs] + \
-                      [{"type": "text", "text": messages[0]["content"][-1]["text"]}]
-            full = [{"role": "user", "content": content},
-                    {"role": "assistant", "content": messages[1]["content"]}]
+            full = _attach_images(messages, imgs)
             proc = self.processor.apply_chat_template(
                 full, chat_template=self.train_template, tokenize=True,
                 return_dict=True, return_tensors="pt",
@@ -217,10 +227,12 @@ class SFTDataset(Dataset):
             item = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
             input_ids = ids
 
-        # supervise only the final assistant span (the suffix of length n_sup).
-        # Pre-filtered to fit, so the span always survives (no truncation here).
-        labels = torch.full((input_ids.shape[0],), -100, dtype=torch.long)
-        labels[-n_sup:] = input_ids[-n_sup:]
+        # supervise the final assistant span; images only inflate the first user
+        # turn, so the offsets-from-end carry over to the expanded sequence.
+        L = input_ids.shape[0]
+        hi, lo = L - tail, L - tail - span_len
+        labels = torch.full((L,), -100, dtype=torch.long)
+        labels[lo:hi] = input_ids[lo:hi]
         item["labels"] = labels
         return item
 
@@ -230,10 +242,17 @@ class DiffusionCollator:
     pad_token_id: int
 
     def __call__(self, batch):
+        has_mm = "pixel_values" in batch[0]
+        # Multimodal needs per_device_train_batch_size=1: examples have different
+        # image counts, so concatenating pixel_values / image_position_ids across a
+        # batch would misalign them with the per-example image tokens. Use
+        # gradient_accumulation_steps for an effective batch instead.
+        if has_mm and len(batch) > 1:
+            raise ValueError("multimodal SFT requires per_device_train_batch_size=1 "
+                             "(use gradient_accumulation_steps for a larger effective batch)")
         maxlen = max(b["input_ids"].shape[0] for b in batch)
         input_ids, attn, labels = [], [], []
         mm = {"pixel_values": [], "image_position_ids": [], "mm_token_type_ids": []}
-        has_mm = "pixel_values" in batch[0]
         for b in batch:
             n = b["input_ids"].shape[0]
             pad = maxlen - n
@@ -261,7 +280,7 @@ class DiffusionCollator:
 # Block-diffusion loss (official) + MoE router aux loss (ours).
 # --------------------------------------------------------------------------- #
 def compute_diffusion_loss(model, inputs, *, vocab_size, canvas_length, eps_t,
-                           self_cond_prob, ar_loss, final_logit_softcapping,
+                           self_cond_prob, ar_loss, ar_loss_weight, final_logit_softcapping,
                            eos_token_id, router_aux_collector=None,
                            router_aux_loss_coef=0.0, return_outputs=False):
     input_ids = inputs["input_ids"]
@@ -344,7 +363,7 @@ def compute_diffusion_loss(model, inputs, *, vocab_size, canvas_length, eps_t,
             if final_logit_softcapping:
                 enc_logits = torch.tanh(enc_logits / final_logit_softcapping) * final_logit_softcapping
             ar = F.cross_entropy(enc_logits, targets)
-            loss = loss + ar
+            loss = loss + ar_loss_weight * ar
 
     # MoE load-balancing aux loss (ours; only meaningful with a trainable router)
     if router_aux_collector is not None and router_aux_loss_coef > 0:
@@ -358,7 +377,7 @@ def compute_diffusion_loss(model, inputs, *, vocab_size, canvas_length, eps_t,
 # --------------------------------------------------------------------------- #
 class DiffusionGemmaSFTTrainer(Trainer):
     def __init__(self, *a, vocab_size, canvas_length, eps_t, self_cond_prob, ar_loss,
-                 final_logit_softcapping, eos_token_id, skip_move=False,
+                 ar_loss_weight, final_logit_softcapping, eos_token_id, skip_move=False,
                  router_aux_collector=None, router_aux_loss_coef=0.0, **kw):
         self._skip_move = skip_move
         super().__init__(*a, **kw)
@@ -367,6 +386,7 @@ class DiffusionGemmaSFTTrainer(Trainer):
         self.eps_t = eps_t
         self.self_cond_prob = self_cond_prob
         self.ar_loss = ar_loss
+        self.ar_loss_weight = ar_loss_weight
         self.final_logit_softcapping = final_logit_softcapping
         self.eos_token_id = eos_token_id
         self.router_aux_collector = router_aux_collector
@@ -381,6 +401,7 @@ class DiffusionGemmaSFTTrainer(Trainer):
         return compute_diffusion_loss(
             model, inputs, vocab_size=self.vocab_size, canvas_length=self.canvas_length,
             eps_t=self.eps_t, self_cond_prob=self.self_cond_prob, ar_loss=self.ar_loss,
+            ar_loss_weight=self.ar_loss_weight,
             final_logit_softcapping=self.final_logit_softcapping, eos_token_id=self.eos_token_id,
             router_aux_collector=self.router_aux_collector,
             router_aux_loss_coef=self.router_aux_loss_coef, return_outputs=return_outputs,
@@ -460,7 +481,7 @@ def main():
     trainer = DiffusionGemmaSFTTrainer(
         model=model, args=ta, train_dataset=ds, data_collator=collator,
         vocab_size=vocab_size, canvas_length=canvas_length, eps_t=sa.eps_t,
-        self_cond_prob=sa.self_cond_prob, ar_loss=sa.ar_loss,
+        self_cond_prob=sa.self_cond_prob, ar_loss=sa.ar_loss, ar_loss_weight=sa.ar_loss_weight,
         final_logit_softcapping=softcap, eos_token_id=tok.eos_token_id,
         skip_move=bool(sa.device_map and not using_deepspeed),
         router_aux_collector=router_aux_collector,
