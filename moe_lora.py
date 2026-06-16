@@ -155,16 +155,31 @@ class LoRALinear(nn.Module):
         return self.base(x) + self.scaling * (x @ self.lora_A.T @ self.lora_B.T)
 
 
-def _wrap_decoder_attention(model, r, alpha):
-    n = 0
+# Official TRL recipe targets: attention q/k/v/o + dense-MLP gate/up/down on BOTH
+# the encoder language model and the decoder layers (all plain nn.Linear; the
+# vision-tower ClippableLinears are excluded). Encoder and decoder share tied
+# base weights but get INDEPENDENT adapters (we wrap the distinct module objects).
+import re as _re
+
+OFFICIAL_LINEARS = _re.compile(
+    r"model\.(encoder\.language_model|decoder)\.layers\.\d+\."
+    r"(self_attn\.[qkvo]_proj|mlp\.(gate|up|down)_proj)$"
+)
+DECODER_ATTN_ONLY = _re.compile(r"model\.decoder\.layers\.\d+\.self_attn\.[qkvo]_proj$")
+
+
+def _wrap_linears(model, r, alpha, pattern):
+    """Wrap every nn.Linear whose module name fullmatches `pattern` with LoRALinear.
+    Returns (total, enc_count, dec_count)."""
+    n = enc = dec = 0
     for name, mod in list(model.named_modules()):
-        if "decoder.layers" in name and name.endswith("self_attn"):
-            for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                lin = getattr(mod, proj, None)
-                if isinstance(lin, nn.Linear):
-                    setattr(mod, proj, LoRALinear(lin, r, alpha))
-                    n += 1
-    return n
+        if isinstance(mod, nn.Linear) and pattern.match(name):
+            parent = model.get_submodule(name.rsplit(".", 1)[0])
+            setattr(parent, name.rsplit(".", 1)[1], LoRALinear(mod, r, alpha))
+            n += 1
+            enc += "encoder" in name
+            dec += "decoder" in name
+    return n, enc, dec
 
 
 # --------------------------------------------------------------------------- #
@@ -180,24 +195,31 @@ def _unfreeze_decoder_routers(model):
     return n
 
 
-def apply_moe_and_decoder_lora(model, r=16, alpha=32, moe=True, decoder_attn=True,
+def apply_moe_and_decoder_lora(model, r=16, alpha=32, moe=True, linears="official",
                                train_router=False):
+    """linears: "official" -> enc/dec attention + dense MLP (lets the AR co-loss
+    train the encoder, like the official recipe); "decoder_attn" -> decoder
+    attention only (our earlier minimal setup); "none" -> experts only.
+    Composed with `moe=True` this is "official recipe + expert LoRA"."""
     # freeze everything first
     for p in model.parameters():
         p.requires_grad_(False)
-    n_moe = n_attn = n_router = 0
+    n_moe = n_router = 0
+    n_lin = n_enc = n_dec = 0
     if moe:
         for _, mod in model.named_modules():
             if type(mod).__name__ == "DiffusionGemmaTextExperts":
                 _add_moe_lora(mod, r, alpha)
                 n_moe += 1
-    if decoder_attn:
-        n_attn = _wrap_decoder_attention(model, r, alpha)
+    if linears == "official":
+        n_lin, n_enc, n_dec = _wrap_linears(model, r, alpha, OFFICIAL_LINEARS)
+    elif linears == "decoder_attn":
+        n_lin, n_enc, n_dec = _wrap_linears(model, r, alpha, DECODER_ATTN_ONLY)
     if train_router:
         # so the MoE load-balancing aux loss can actually move the routing
         n_router = _unfreeze_decoder_routers(model)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"MoE-LoRA: experts={n_moe}  decoder_attn_linears={n_attn}  "
+    print(f"MoE-LoRA: experts={n_moe}  linears={n_lin}(enc={n_enc} dec={n_dec})  "
           f"routers_trainable={n_router}  trainable={trainable/1e6:.1f}M", flush=True)
     return model
 

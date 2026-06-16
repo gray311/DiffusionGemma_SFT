@@ -1,46 +1,31 @@
-"""SFT for google/diffusiongemma-26B-A4B-it with the HuggingFace Trainer.
+"""SFT for google/diffusiongemma-26B-A4B-it — aligned with the official TRL
+recipe (trl examples/scripts/sft_diffusion_gemma.py, PR #6003), with two
+deliberate departures we keep:
 
-DiffusionGemma is a *block-diffusion* model (encoder-decoder): an autoregressive
-encoder prefills the prompt context into a KV cache, and a bidirectional decoder
-denoises a fixed-length block of tokens (a "canvas", default 256) conditioned on
-that cache. The model's `forward` returns ONLY logits over the canvas — the
-diffusion loss is computed here in the trainer (confirmed by HF PRs #46568 /
-#46572).
+  1. LoRA mounting: we adapt the MoE EXPERTS (+ decoder attention) via moe_lora.py
+     instead of the official "attention + dense-MLP, experts frozen" recipe,
+     because we specifically want to fine-tune the experts.
+  2. MoE load-balancing (router aux) loss: kept on (--router_aux_loss_coef). The
+     official code will add this upstream later.
 
-Training objective (uniform discrete diffusion — matches the model's sampler,
-which initializes a canvas with RANDOM vocab tokens and renoises rejected
-positions with random tokens; there is NO [MASK] token):
+Everything else mirrors the official block-diffusion objective:
+  * One full sequence per example via the TRAINING chat template
+    (chat_templates/diffusion_gemma_training.jinja); the supervised span is the
+    final assistant turn (content + closing `<turn|>`), `labels=-100` elsewhere.
+  * compute_loss derives the response span from `labels`, selects ONE response
+    block at random (so answers longer than canvas_length are covered over
+    training), encodes the full clean sequence, and the decoder mask cuts the KV
+    cache off at the prompt + clean blocks BEFORE the selected one.
+  * Clean canvas = the block, EOS-filled past the response end; flat CE over the
+    whole canvas (no 1/t weighting). Plus an autoregressive co-loss on the
+    encoder (with final_logit_softcapping), and self-conditioning at p=0.5.
 
-  1. Take a (prompt, response) pair. Pick one response block of `canvas_length`
-     tokens as the canvas x0; everything before it (prompt + earlier response
-     tokens) is the encoder context.
-  2. Sample a noise level t ~ U(eps, 1). Corrupt the canvas: each canvas token is
-     replaced by a uniform-random vocab token with prob t  ->  x_t.
-  3. logits = model(input_ids=context, decoder_input_ids=x_t, ...)
-  4. Loss = cross-entropy(logits, x0) over the (valid) canvas positions. Because
-     the corruption is uniform (the model can't tell which tokens are clean), the
-     denoiser is trained to predict x0 at EVERY canvas position. Optional 1/t
-     ELBO-style weighting via --weight_by_t.
-
-Notes / scope:
-  * Text SFT. Multimodal (image) SFT needs pixel_values routed through the
-    encoder — hooks are marked with `MULTIMODAL:` below.
-  * 26B params do not fit for full fine-tuning on one 80GB GPU, so LoRA on the
-    attention projections is the default. Gradient checkpointing is OFF because
-    transformers 5.12.1 sets supports_gradient_checkpointing=False for this model
-    (PR #46572 re-enables it in a later release).
-  * Self-conditioning (the model's `self_conditioning_logits/_mask`) is supported
-    via --self_cond_prob (default 0, i.e. off; doubles the forward cost when on).
-
-Smoke test (a few steps on the toy data, no real training):
-    python train_diffusiongemma_sft.py --smoke
-
-Real run example: see run_sft.sh
+Smoke test: python train_diffusiongemma_sft.py --smoke
+Real run: see run_moe_lora.sh
 """
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import dataclass, field
 
@@ -56,6 +41,9 @@ from transformers import (
     set_seed,
 )
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+TRAIN_TEMPLATE_PATH = os.path.join(HERE, "chat_templates", "diffusion_gemma_training.jinja")
+
 
 # --------------------------------------------------------------------------- #
 # Args
@@ -64,375 +52,318 @@ from transformers import (
 class ScriptArgs:
     model_path: str = "/weka/home/ext-yingzima/scratchaszalay1_ssci/yy/huggingface/diffusiongemma-26B-A4B-it"
     train_file: str = "data/example_sft.jsonl"
-    # JSONL; each line either {"messages": [{"role","content"}, ...]} OR
-    # {"prompt": "...", "response": "..."}.
-    # --- multimodal (image) SFT ---
+    # data_format: "qa" -> {"image":[...], "question":"...<image>...", "answer":"..."}
+    #              "conversations" -> {"image":[...], "conversations":[{from,value}...]}
+    data_format: str = "qa"
     multimodal: bool = False
-    # JSON list of {"image": [paths], "question": "...<image>...", "answer": "..."}.
-    image_path_from: str = "/weka/home/xliu316/"      # rewrite image paths ...
-    image_path_to: str = "/weka/home/ext-yingzima/"   # ... to here
-    max_context_len: int = 1024  # encoder context cap (prompt + response prefix)
-    single_block: bool = True    # train on the first canvas block (256 tokens) only
-    eps_t: float = 1e-3          # min noise level
-    weight_by_t: bool = False    # 1/t ELBO-style weighting of the per-token loss
-    self_cond_prob: float = 0.0  # prob of enabling self-conditioning per example
-    encoder_ar_loss_weight: float = 0.0  # add lambda * AR next-token loss on the encoder context
-    # LoRA
+    # image path resolution: if image_path_from is non-empty and present in a path,
+    # replace it with image_path_to; otherwise a RELATIVE path is joined onto
+    # image_path_to (treated as a base dir). Absolute paths pass through.
+    image_path_from: str = "/weka/home/xliu316/"
+    image_path_to: str = "/weka/home/ext-yingzima/"
+    max_examples: int = 0             # 0 = all; else use the first N examples
+    max_images: int = 0               # 0 = all; else cap images/example (memory)
+    max_length: int = 1024            # full-sequence cap (official default)
+    eps_t: float = 1e-3               # min corruption ratio
+    self_cond_prob: float = 0.5       # self-conditioning probability (official: 0.5)
+    ar_loss: bool = True              # encoder autoregressive co-loss (official: on)
+    # LoRA (our MoE-expert mounting, kept)
     use_lora: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    # lora_mode: "peft" -> stock peft on nn.Linear (can't reach MoE experts);
-    #            "moe"  -> manual MoE-LoRA on the 128 experts (88% of params,
-    #                      raw 3D Parameters peft can't touch) + manual LoRA on
-    #                      the decoder attention. Fits one 80GB A100 (~70GB peak).
-    lora_mode: str = "peft"
-    moe_decoder_attn: bool = True   # (moe mode) also LoRA the decoder attention
-    # MoE load-balancing (router auxiliary) loss — keeps the router from
-    # collapsing onto a few experts (HF PR #46642). 0 = off (default, matching
-    # the PR). Typical: 1e-2. Only has an effect when the router is trainable:
-    # full FT, or moe-LoRA with --train_router True (auto-enabled when coef>0).
+    lora_dropout: float = 0.0         # official lora_dropout = 0.0
+    lora_mode: str = "moe"            # "moe" -> moe_lora.py ; "peft" -> stock peft
+    # which nn.Linears to LoRA in moe mode: "official" -> enc/dec attention +
+    # dense MLP (so the AR co-loss can train the encoder, like the official
+    # recipe) ; "decoder_attn" -> decoder attention only ; "none" -> experts only.
+    lora_linears: str = "official"
+    lora_target: str = "all-linear"   # only used when lora_mode == "peft"
+    # MoE load-balancing aux loss (kept). 0 = off. >0 auto-unfreezes the router.
     router_aux_loss_coef: float = 0.0
-    train_router: bool = False      # (moe mode) unfreeze decoder routers
-    # IMPORTANT (this model is special): encoder attention is wrapped in
-    # Gemma4ClippableLinear (inner ".linear") while DECODER attention is a bare
-    # nn.Linear, and encoder/decoder share weights. Targeting "q_proj.linear"
-    # ONLY hits the encoder (prefill) and misses the decoder denoising path
-    # entirely. Use "all-linear" so peft wraps every nn.Linear on BOTH sides
-    # (enc+dec attention + dense MLP). The 128 MoE experts are raw Parameters
-    # and can't be LoRA'd (need full FT for those).
-    lora_target: str = "all-linear"
-    # placement: "" -> load to CPU, Trainer moves to a single GPU (e.g. 80GB H100,
-    # where the 52GB model fits). "auto" -> shard across all visible GPUs
-    # (model-parallel; needed when no single GPU holds the model, e.g. 4xL40S).
+    train_router: bool = False
+    # placement
     device_map: str = ""
-    # (model-parallel) per-GPU GiB cap at load time to FORCE the model to split
-    # across GPUs. 0 = use 92% of GPU0 (which leaves the model on one GPU if it
-    # fits). Set e.g. 30 to split the 50GB base ~evenly over 2 GPUs.
     mp_cap_gib: int = 0
-    # attn impl: the sdpa mask builder mishandles this model's sliding+vision
-    # bidirectional mask during a training forward (5D-expand crash), so default
-    # to eager. Set "sdpa"/"flash_attention_2" once that path is fixed upstream.
-    attn_implementation: str = "eager"
-    # misc
+    attn_implementation: str = "sdpa"
     smoke: bool = False
 
 
 # --------------------------------------------------------------------------- #
-# Dataset: tokenize once into (prompt_ids, response_ids)
+# Dataset: one full sequence per example via the TRAINING chat template.
+# Returns input_ids / attention_mask / labels (+ multimodal tensors). The block
+# selection happens later in compute_loss (mirrors the official recipe).
 # --------------------------------------------------------------------------- #
-class ChatSFTDataset(Dataset):
-    def __init__(self, path, processor, max_context_len):
-        self.examples = []
-        tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                if "messages" in row:
-                    msgs = row["messages"]
-                    assert msgs[-1]["role"] == "assistant", "last message must be assistant"
-                    prompt_msgs = msgs[:-1]
-                    answer = msgs[-1]["content"]
-                else:
-                    prompt_msgs = [{"role": "user", "content": row["prompt"]}]
-                    answer = row["response"]
-                # prompt = chat template up to the generation prompt
-                prompt_ids = processor.apply_chat_template(
-                    prompt_msgs, tokenize=True, add_generation_prompt=True,
-                )
-                if isinstance(prompt_ids, dict):
-                    prompt_ids = prompt_ids["input_ids"]
-                if hasattr(prompt_ids, "tolist"):
-                    prompt_ids = prompt_ids.tolist()
-                    if prompt_ids and isinstance(prompt_ids[0], list):
-                        prompt_ids = prompt_ids[0]
-                # response tokens (plus EOS) — what the canvas must denoise
-                resp_ids = tok(answer, add_special_tokens=False)["input_ids"]
-                eos = tok.eos_token_id if tok.eos_token_id is not None else 1
-                resp_ids = resp_ids + [eos]
-                # cap context so prompt fits
-                if len(prompt_ids) > max_context_len:
-                    prompt_ids = prompt_ids[-max_context_len:]
-                self.examples.append({"prompt_ids": prompt_ids, "response_ids": resp_ids})
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, i):
-        return self.examples[i]
+def _resolve_image(p, path_from, path_to):
+    if path_from and path_from in p:
+        return p.replace(path_from, path_to)
+    if not os.path.isabs(p):
+        return os.path.join(path_to, p)   # path_to as a base dir for relative paths
+    return p
 
 
-# --------------------------------------------------------------------------- #
-# Multimodal dataset: image+text prompt -> processor (input_ids w/ image tokens
-# + pixel_values + image_position_ids + mm_token_type_ids); answer -> canvas.
-# Processed lazily (1000s of images won't fit if eager).
-# --------------------------------------------------------------------------- #
-class MultimodalSFTDataset(Dataset):
-    def __init__(self, path, processor, path_from, path_to, max_context_len):
-        self.data = json.load(open(path))
+def _to_messages(ex, data_format, path_from, path_to, max_images=0):
+    """Return (messages, image_paths). Last message is the assistant response."""
+    fix = lambda p: _resolve_image(p, path_from, path_to)
+    cap = lambda lst: lst[:max_images] if max_images > 0 else lst
+    if data_format == "qa":
+        imgs = cap([fix(p) for p in ex.get("image", []) or []])
+        qtext = ex["question"].replace("<image>", "").strip()
+        answer = ex["answer"]
+    elif data_format == "conversations":
+        imgs = [fix(p) for p in ex.get("image", []) or []]
+        conv = ex["conversations"]
+        # use the prompt up to (and including) the final assistant/gpt turn
+        last_gpt = max(i for i, m in enumerate(conv) if m["from"] in ("gpt", "assistant"))
+        user_text = "\n".join(m["value"] for m in conv[:last_gpt] if m["from"] in ("human", "user"))
+        user_text = user_text.replace("<image>", "").strip()
+        answer = conv[last_gpt]["value"]
+        qtext = user_text
+    else:
+        raise ValueError(f"unknown data_format {data_format}")
+
+    if imgs:
+        content = [{"type": "image", "image": p} for p in imgs] + [{"type": "text", "text": qtext}]
+    else:
+        content = qtext
+    messages = [{"role": "user", "content": content}, {"role": "assistant", "content": answer}]
+    return messages, imgs
+
+
+class SFTDataset(Dataset):
+    def __init__(self, path, processor, sa: ScriptArgs):
+        self.data = json.load(open(path)) if path.endswith(".json") else \
+            [json.loads(l) for l in open(path) if l.strip()]
+        if sa.max_examples > 0:
+            self.data = self.data[: sa.max_examples]
         self.processor = processor
         self.tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        self.path_from, self.path_to = path_from, path_to
-        self.max_context_len = max_context_len
+        self.sa = sa
+        self.train_template = open(TRAIN_TEMPLATE_PATH).read()
+        self.eot_id = self.tok.convert_tokens_to_ids("<end_of_turn>")
 
     def __len__(self):
         return len(self.data)
 
-    def _fix(self, p):
-        return p.replace(self.path_from, self.path_to)
+    def _n_supervised(self, messages_textonly):
+        """Token count of the supervised suffix (final assistant content + <turn|>),
+        from a text-only render (images count as 1 literal token in the user turn,
+        so the assistant suffix length is unaffected by image expansion)."""
+        out = self.tok.apply_chat_template(
+            messages_textonly, chat_template=self.train_template, tokenize=True,
+            return_assistant_tokens_mask=True, return_dict=True,
+        )
+        return int(sum(out["assistant_masks"]))
 
     def __getitem__(self, i):
-        from PIL import Image
+        sa = self.sa
         ex = self.data[i]
-        imgs = [Image.open(self._fix(p)).convert("RGB") for p in ex["image"]]
-        # images are passed as content items; drop the literal <image> markers
-        qtext = ex["question"].replace("<image>", "").strip()
-        content = [{"type": "image", "image": im} for im in imgs]
-        content.append({"type": "text", "text": qtext})
-        proc = self.processor.apply_chat_template(
-            [{"role": "user", "content": content}],
-            tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt",
-        )
-        # input_ids/attention_mask/mm_token_type_ids have a batch dim (1, seq) ->
-        # drop it. pixel_values/image_position_ids are (num_images, ...) with NO
-        # batch dim (first dim = image count) -> keep all images.
-        per_image = {"pixel_values", "image_position_ids"}
-        prompt = {k: (v if k in per_image else v[0]) for k, v in proc.items()}
-        eos = self.tok.eos_token_id if self.tok.eos_token_id is not None else 1
-        resp_ids = self.tok(ex["answer"], add_special_tokens=False)["input_ids"] + [eos]
-        return {"prompt": prompt, "response_ids": resp_ids}
+        messages, img_paths = _to_messages(ex, sa.data_format, sa.image_path_from, sa.image_path_to)
+
+        # text-only copy (replace image dicts with a placeholder string) for the
+        # supervised-suffix count
+        msgs_txt = []
+        for m in messages:
+            c = m["content"]
+            if isinstance(c, list):
+                c = "".join("<image>" if it.get("type") == "image" else it.get("text", "") for it in c)
+            msgs_txt.append({"role": m["role"], "content": c})
+        n_sup = self._n_supervised(msgs_txt)
+
+        if img_paths:
+            from PIL import Image
+            imgs = [Image.open(p).convert("RGB") for p in img_paths]
+            content = [{"type": "image", "image": im} for im in imgs] + \
+                      [{"type": "text", "text": messages[0]["content"][-1]["text"]}]
+            full_msgs = [{"role": "user", "content": content},
+                         {"role": "assistant", "content": messages[1]["content"]}]
+            proc = self.processor.apply_chat_template(
+                full_msgs, chat_template=self.train_template, tokenize=True,
+                return_dict=True, return_tensors="pt",
+            )
+            per_image = {"pixel_values", "image_position_ids"}
+            item = {k: (v if k in per_image else v[0]) for k, v in proc.items()}
+            input_ids = item["input_ids"]
+        else:
+            ids = self.tok.apply_chat_template(
+                messages, chat_template=self.train_template, tokenize=True, return_tensors="pt",
+            )[0]
+            item = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+            input_ids = ids
+
+        # labels: supervise only the final assistant span (the suffix of length n_sup)
+        seq_len = input_ids.shape[0]
+        labels = torch.full((seq_len,), -100, dtype=torch.long)
+        if n_sup > 0:
+            labels[-n_sup:] = input_ids[-n_sup:]
+        item["labels"] = labels
+
+        # right-truncate to max_length if needed (keeps prompt+images+early answer)
+        if seq_len > sa.max_length:
+            for k in ("input_ids", "attention_mask", "labels", "mm_token_type_ids"):
+                if k in item and torch.is_tensor(item[k]) and item[k].shape[0] == seq_len:
+                    item[k] = item[k][: sa.max_length]
+        return item
 
 
 @dataclass
-class MultimodalCollator:
-    """batch_size=1 collator for multimodal SFT: the whole image+text prompt is
-    the encoder context, the answer's first block is the canvas."""
-    canvas_length: int
+class DiffusionCollator:
     pad_token_id: int
 
     def __call__(self, batch):
-        assert len(batch) == 1, "multimodal SFT uses per_device_train_batch_size=1"
-        ex = batch[0]
-        p = ex["prompt"]
-        L = self.canvas_length
-        r = ex["response_ids"][:L]
-        cmask = [1] * len(r) + [0] * (L - len(r))
-        canvas = r + [self.pad_token_id] * (L - len(r))
-
-        ctx = p["input_ids"]                       # (ctx_len,)
-        ctx_len = ctx.shape[0]
-        attn = p["attention_mask"]                 # (ctx_len,)
-        dec_pos = (int(attn.sum()) + torch.arange(L)).long()
-        dec_attn = torch.cat([attn, torch.ones(L, dtype=attn.dtype)])
-
+        maxlen = max(b["input_ids"].shape[0] for b in batch)
+        input_ids, attn, labels = [], [], []
+        mm = {"pixel_values": [], "image_position_ids": [], "mm_token_type_ids": []}
+        has_mm = "pixel_values" in batch[0]
+        for b in batch:
+            n = b["input_ids"].shape[0]
+            pad = maxlen - n
+            input_ids.append(F.pad(b["input_ids"], (0, pad), value=self.pad_token_id))
+            attn.append(F.pad(b["attention_mask"], (0, pad), value=0))
+            labels.append(F.pad(b["labels"], (0, pad), value=-100))
+            if has_mm:
+                mm["pixel_values"].append(b["pixel_values"])
+                mm["image_position_ids"].append(b["image_position_ids"])
+                mm["mm_token_type_ids"].append(F.pad(b["mm_token_type_ids"], (0, pad), value=0))
         out = {
-            "input_ids": ctx.unsqueeze(0),
-            "attention_mask": attn.unsqueeze(0),
-            # (num_images, patches, dim) — NOT batched; the encoder flattens
-            # all images of the (batch=1) example together.
-            "pixel_values": p["pixel_values"],
-            "image_position_ids": p["image_position_ids"],
-            "mm_token_type_ids": p["mm_token_type_ids"].unsqueeze(0),
-            "canvas_input_ids": torch.tensor(canvas, dtype=torch.long).unsqueeze(0),
-            "canvas_loss_mask": torch.tensor(cmask, dtype=torch.bool).unsqueeze(0),
-            "decoder_position_ids": dec_pos.unsqueeze(0),
-            "decoder_attention_mask": dec_attn.unsqueeze(0),
+            "input_ids": torch.stack(input_ids),
+            "attention_mask": torch.stack(attn),
+            "labels": torch.stack(labels),
         }
+        if has_mm:
+            # per-example images differ in count; batch=1 is the supported path.
+            out["pixel_values"] = torch.cat(mm["pixel_values"], dim=0)
+            out["image_position_ids"] = torch.cat(mm["image_position_ids"], dim=0)
+            out["mm_token_type_ids"] = torch.stack(mm["mm_token_type_ids"])
         return out
 
 
 # --------------------------------------------------------------------------- #
-# Collator: pick a random response block as the canvas; build encoder context,
-# right-padded; emit clean canvas x0 + masks + decoder positions.
+# Block-diffusion loss (official) + MoE router aux loss (ours).
 # --------------------------------------------------------------------------- #
-@dataclass
-class BlockDiffusionCollator:
-    canvas_length: int
-    pad_token_id: int
-    max_context_len: int
-    single_block: bool = True
-    generator: torch.Generator | None = None
+def compute_diffusion_loss(model, inputs, *, vocab_size, canvas_length, eps_t,
+                           self_cond_prob, ar_loss, final_logit_softcapping,
+                           eos_token_id, router_aux_collector=None,
+                           router_aux_loss_coef=0.0, return_outputs=False):
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    labels = inputs["labels"]
+    device = input_ids.device
+    batch_size, seq_len = input_ids.shape
+    block_size = canvas_length
 
-    def _rand_block_start(self, n_resp):
-        # one-block training: the canvas is the response's first 256 tokens
-        # (context = prompt). Otherwise pick a random block.
-        if self.single_block:
-            return 0
-        n_blocks = max(1, math.ceil(n_resp / self.canvas_length))
-        k = int(torch.randint(0, n_blocks, (1,), generator=self.generator).item())
-        return k * self.canvas_length
+    # response span from labels (the final supervised assistant turn)
+    supervised = labels != -100
+    positions = torch.arange(seq_len, device=device)
+    span_starts = supervised & ~F.pad(supervised, (1, 0))[:, :-1]
+    span_end = torch.where(supervised, positions, torch.full_like(positions, -1)).amax(dim=1)
+    prefix_len = torch.where(span_starts, positions, torch.full_like(positions, -1)).amax(dim=1).clamp(min=0)
+    response_len = (span_end - prefix_len + 1) * (span_end >= 0)
 
-    def __call__(self, batch):
-        L = self.canvas_length
-        contexts, canvases, canvas_masks = [], [], []
-        for ex in batch:
-            p, r = ex["prompt_ids"], ex["response_ids"]
-            start = self._rand_block_start(len(r))
-            context = p + r[:start]
-            context = context[-self.max_context_len:]
-            block = r[start:start + L]
-            cmask = [1] * len(block) + [0] * (L - len(block))
-            block = block + [self.pad_token_id] * (L - len(block))
-            contexts.append(context)
-            canvases.append(block)
-            canvas_masks.append(cmask)
+    # select one response block; encoder reads the full clean sequence, the decoder
+    # may only see the prompt + clean response blocks BEFORE the selected one.
+    num_blocks = (response_len - 1).clamp(min=0) // block_size + 1
+    block_idx = (torch.rand(batch_size, device=device) * num_blocks).long()
+    encoder_len = prefix_len + block_idx * block_size
 
-        ctx_len = max(len(c) for c in contexts)
-        input_ids, attn = [], []
-        for c in contexts:
-            pad = ctx_len - len(c)
-            input_ids.append(c + [self.pad_token_id] * pad)   # right-pad
-            attn.append([1] * len(c) + [0] * pad)
+    # clean canvas: the block, EOS-filled past the end of the response (supervised)
+    offsets = torch.arange(block_size, device=device)
+    abs_idx = (encoder_len[:, None] + offsets).clamp(max=seq_len - 1)
+    in_response = offsets < (response_len - block_idx * block_size)[:, None]
+    canvas_target = torch.where(in_response, input_ids.gather(1, abs_idx), torch.tensor(eos_token_id, device=device))
 
-        input_ids = torch.tensor(input_ids, dtype=torch.long)
-        attn = torch.tensor(attn, dtype=torch.long)
-        canvas = torch.tensor(canvases, dtype=torch.long)
-        canvas_mask = torch.tensor(canvas_masks, dtype=torch.bool)
+    # uniform random-token corruption (no mask token), per-example t ~ U(eps, 1)
+    t = eps_t + (1 - eps_t) * torch.rand(batch_size, 1, device=device)
+    corrupt = torch.rand(batch_size, block_size, device=device) < t
+    random_tokens = torch.randint(vocab_size, (batch_size, block_size), device=device)
+    canvas_ids = torch.where(corrupt, random_tokens, canvas_target)
 
-        # decoder positions: each canvas starts at that example's TRUE context len
-        true_len = attn.sum(dim=1)  # (B,)
-        dec_pos = (true_len[:, None] + torch.arange(L)[None, :]).to(torch.long)
-        # decoder attention over [context_cache | canvas]; canvas always visible
-        dec_attn = torch.cat([attn, torch.ones((attn.shape[0], L), dtype=torch.long)], dim=1)
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attn,
-            "canvas_input_ids": canvas,         # clean x0
-            "canvas_loss_mask": canvas_mask,    # valid response positions
-            "decoder_position_ids": dec_pos,
-            "decoder_attention_mask": dec_attn,
-        }
-
-
-# --------------------------------------------------------------------------- #
-# Core: corrupt the canvas (uniform noise) and compute the denoising loss.
-# Standalone so it can be unit-tested without the full Trainer.
-# --------------------------------------------------------------------------- #
-def compute_diffusion_loss(model, inputs, *, vocab_size, eps_t=1e-3,
-                           weight_by_t=False, self_cond_prob=0.0,
-                           encoder_ar_loss_weight=0.0, pad_token_id=0,
-                           router_aux_collector=None, router_aux_loss_coef=0.0,
-                           return_outputs=False):
-    x0 = inputs["canvas_input_ids"]
-    cmask = inputs["canvas_loss_mask"]
-    B, L = x0.shape
-    dev = x0.device
-
-    # forward (uniform) noise: replace each valid canvas token w/ prob t
-    t = torch.empty(B, 1, device=dev).uniform_(eps_t, 1.0)
-    corrupt = (torch.rand(B, L, device=dev) < t) & cmask
-    rand_tok = torch.randint(0, vocab_size, (B, L), device=dev)
-    x_t = torch.where(corrupt, rand_tok, x0)
-
-    # The encoder builds its own causal mask via create_masks_for_generate when
-    # attention_mask is None; passing a raw 2D mask there hits a shape bug. With
-    # no padding (the common per_device_batch=1 case) None is equivalent, so use
-    # it. (Multi-example batches with padding need length-packing instead.)
-    # No padding (per_device_batch=1) -> pass attention_mask=None so the encoder
-    # builds its own causal mask. (Padded multi-example batches need length
-    # packing, not naive padding, due to the encoder's mask path.)
-    enc_am = inputs["attention_mask"]
-    enc_am = None if bool((enc_am == 1).all()) else enc_am
-    fwd = dict(
-        input_ids=inputs["input_ids"],
-        attention_mask=enc_am,
-        decoder_input_ids=x_t,
-        decoder_position_ids=inputs["decoder_position_ids"],
-        decoder_attention_mask=inputs["decoder_attention_mask"],
-    )
-    # multimodal: route image tensors to the encoder (vision tower + the
-    # bidirectional image-token mask is driven by mm_token_type_ids).
+    cache_mask = (torch.arange(seq_len, device=device) < encoder_len[:, None]).long()
+    canvas_mask = torch.ones(batch_size, block_size, dtype=torch.long, device=device)
+    mk = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "decoder_input_ids": canvas_ids,
+        "decoder_attention_mask": torch.cat([cache_mask, canvas_mask], dim=1),
+        "decoder_position_ids": encoder_len[:, None] + offsets,
+    }
     for k in ("pixel_values", "image_position_ids", "mm_token_type_ids"):
         if inputs.get(k) is not None:
-            fwd[k] = inputs[k]
-    if "pixel_values" in fwd:
-        # match the vision tower weights; model may be a DeepSpeedEngine (no .dtype)
+            mk[k] = inputs[k]
+    if "pixel_values" in mk:
         vt_dtype = next(p for p in model.parameters() if p.dtype.is_floating_point).dtype
-        fwd["pixel_values"] = fwd["pixel_values"].to(vt_dtype)
+        mk["pixel_values"] = mk["pixel_values"].to(vt_dtype)
 
-    # optional self-conditioning: a 1st no-grad pass feeds the 2nd
-    sc_logits, sc_mask = None, None
+    # two-pass self-conditioning, gated per example
     if self_cond_prob > 0:
-        sc_mask = torch.rand(B, device=dev) < self_cond_prob
-        if sc_mask.any():
-            with torch.no_grad():
-                sc_logits = model(**fwd).logits.detach()
+        with torch.no_grad():
+            mk["self_conditioning_logits"] = model(**mk).logits
+        mk["self_conditioning_mask"] = torch.rand(batch_size, device=device) < self_cond_prob
 
-    # clear any router captures from the no-grad self-conditioning pass so only
-    # the loss-bearing forward's routing contributes to the aux loss.
+    # only the loss-bearing forward's routing should feed the aux loss
     if router_aux_collector is not None:
         router_aux_collector.reset()
-    out = model(self_conditioning_logits=sc_logits, self_conditioning_mask=sc_mask, **fwd)
-    logits = out.logits.float()  # (B, L, V)
+    outputs = model(**mk)
 
-    ce = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]), x0.reshape(-1), reduction="none",
-    ).view(B, L)
-    ce = ce * cmask
-    if weight_by_t:
-        ce = ce / t
-    loss = ce.sum() / cmask.sum().clamp(min=1)
+    # flat CE over the whole canvas (corrupted and clean alike); no 1/t weighting
+    diffusion_loss = F.cross_entropy(outputs.logits.flatten(0, 1).float(), canvas_target.flatten())
+    loss = diffusion_loss
 
-    # optional AR next-token loss on the encoder context
-    if encoder_ar_loss_weight > 0 and getattr(out, "encoder_last_hidden_state", None) is not None:
-        enc_logits = model.get_output_embeddings()(out.encoder_last_hidden_state).float()
-        ctx = inputs["input_ids"]
-        ar = F.cross_entropy(
-            enc_logits[:, :-1].reshape(-1, enc_logits.shape[-1]),
-            ctx[:, 1:].reshape(-1), ignore_index=pad_token_id, reduction="mean",
-        )
-        loss = loss + encoder_ar_loss_weight * ar
+    # autoregressive co-loss on the encoder (text positions only). Gather the
+    # valid positions BEFORE the lm_head so we never materialize a (seq x vocab)
+    # logits tensor — over a long 4-image sequence that float32 tensor alone is
+    # ~2GB and OOMs. Numerically identical to project-then-mask.
+    if ar_loss and getattr(outputs, "encoder_last_hidden_state", None) is not None:
+        head = model.get_output_embeddings()
+        ar_mask = attention_mask[:, :-1].bool() & attention_mask[:, 1:].bool()
+        if inputs.get("mm_token_type_ids") is not None:
+            ar_mask = ar_mask & (inputs["mm_token_type_ids"][:, 1:] == 0)  # skip image tokens
+        if ar_mask.any():
+            hidden = outputs.encoder_last_hidden_state[:, :-1][ar_mask]    # (N, H), N << seq
+            targets = input_ids[:, 1:][ar_mask]                           # (N,)
+            enc_logits = head(hidden.to(head.weight.dtype)).float()        # (N, vocab)
+            if final_logit_softcapping:
+                enc_logits = torch.tanh(enc_logits / final_logit_softcapping) * final_logit_softcapping
+            ar = F.cross_entropy(enc_logits, targets)
+            loss = loss + ar
 
-    # MoE load-balancing auxiliary loss (keeps the router from collapsing onto a
-    # few experts). Only meaningful when the router is trainable (full FT, or
-    # MoE-LoRA with train_router=True). Logged via out for visibility.
+    # MoE load-balancing aux loss (ours; only meaningful with a trainable router)
     if router_aux_collector is not None and router_aux_loss_coef > 0:
         aux = router_aux_collector.aux_loss()
         if aux is not None:
             loss = loss + router_aux_loss_coef * aux
 
-    return (loss, out) if return_outputs else loss
+    return (loss, outputs) if return_outputs else loss
 
 
-# --------------------------------------------------------------------------- #
-# Trainer wrapper around the loss above.
 # --------------------------------------------------------------------------- #
 class DiffusionGemmaSFTTrainer(Trainer):
-    def __init__(self, *a, vocab_size, eps_t, weight_by_t, self_cond_prob,
-                 encoder_ar_loss_weight, pad_token_id, skip_move=False,
+    def __init__(self, *a, vocab_size, canvas_length, eps_t, self_cond_prob, ar_loss,
+                 final_logit_softcapping, eos_token_id, skip_move=False,
                  router_aux_collector=None, router_aux_loss_coef=0.0, **kw):
-        self._skip_move = skip_move  # set before super().__init__ (it may move)
+        self._skip_move = skip_move
         super().__init__(*a, **kw)
         self.vocab_size = vocab_size
+        self.canvas_length = canvas_length
         self.eps_t = eps_t
-        self.weight_by_t = weight_by_t
         self.self_cond_prob = self_cond_prob
-        self.encoder_ar_loss_weight = encoder_ar_loss_weight
-        self.pad_token_id = pad_token_id
+        self.ar_loss = ar_loss
+        self.final_logit_softcapping = final_logit_softcapping
+        self.eos_token_id = eos_token_id
         self.router_aux_collector = router_aux_collector
         self.router_aux_loss_coef = router_aux_loss_coef
 
     def _move_model_to_device(self, model, device):
-        # When the model is sharded across GPUs (device_map), it's already
-        # placed; moving it via .to() crashes on accelerate-dispatched tensors.
         if self._skip_move:
             return
         super()._move_model_to_device(model, device)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         return compute_diffusion_loss(
-            model, inputs, vocab_size=self.vocab_size, eps_t=self.eps_t,
-            weight_by_t=self.weight_by_t, self_cond_prob=self.self_cond_prob,
-            encoder_ar_loss_weight=self.encoder_ar_loss_weight,
-            pad_token_id=self.pad_token_id,
+            model, inputs, vocab_size=self.vocab_size, canvas_length=self.canvas_length,
+            eps_t=self.eps_t, self_cond_prob=self.self_cond_prob, ar_loss=self.ar_loss,
+            final_logit_softcapping=self.final_logit_softcapping, eos_token_id=self.eos_token_id,
             router_aux_collector=self.router_aux_collector,
-            router_aux_loss_coef=self.router_aux_loss_coef,
-            return_outputs=return_outputs,
+            router_aux_loss_coef=self.router_aux_loss_coef, return_outputs=return_outputs,
         )
 
 
@@ -441,10 +372,8 @@ def main():
     parser = HfArgumentParser((ScriptArgs, TrainingArguments))
     sa, ta = parser.parse_args_into_dataclasses()
     set_seed(ta.seed)
-    # our dataset yields {prompt_ids, response_ids}; the custom collator needs
-    # them, so stop the Trainer from stripping "unused" columns.
     ta.remove_unused_columns = False
-    ta.label_names = []  # loss is computed in compute_loss, not from "labels"
+    ta.label_names = []
 
     if sa.smoke:
         ta.max_steps = 4
@@ -458,120 +387,61 @@ def main():
     tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
 
-    # Placement (see ScriptArgs.device_map):
-    #  - single GPU: load to CPU, Trainer moves to cuda:0. (device_map="auto" on
-    #    a single GPU leaves meta tensors that crash Trainer._move_model_to_device.)
-    #  - model-parallel: device_map="auto" shards across visible GPUs; the
-    #    Trainer detects multi-device hf_device_map and skips the .to() move.
-    # Placement priority:
-    #  - DeepSpeed (--deepspeed cfg): the recommended multi-GPU path. With ZeRO-3
-    #    the 52GB base is param-sharded across GPUs. `ta` is already parsed, so
-    #    the global HfDeepSpeedConfig is live and from_pretrained loads under
-    #    zero.Init (no full per-rank copy). Do NOT use device_map here.
-    #  - device_map="auto": naive model-parallel fallback (no DeepSpeed).
-    #  - "": single GPU (fits on an 80GB H100); Trainer moves it to cuda:0.
     using_deepspeed = bool(getattr(ta, "deepspeed", None))
     load_kw = dict(dtype=torch.bfloat16, attn_implementation=sa.attn_implementation)
     if sa.device_map and not using_deepspeed:
         load_kw["device_map"] = sa.device_map
         n = torch.cuda.device_count()
-        # mp_cap_gib > 0: cap per-GPU load budget so the (50GB) model is FORCED to
-        # split across GPUs. Without this, device_map="auto" packs the whole model
-        # onto GPU0 (it fits in 80GB) -> 1 device -> Trainer falls back to
-        # DataParallel (wrong) instead of model-parallel, and one GPU's activation
-        # spike on the heavy 3-image examples OOMs. A low cap leaves the rest of
-        # each GPU free for activations.
-        if sa.mp_cap_gib > 0:
-            per = sa.mp_cap_gib
-        else:
-            per = int(torch.cuda.get_device_properties(0).total_memory / 1e9 * 0.92)
+        per = sa.mp_cap_gib if sa.mp_cap_gib > 0 else int(torch.cuda.get_device_properties(0).total_memory / 1e9 * 0.92)
         load_kw["max_memory"] = {i: f"{per}GiB" for i in range(n)}
     model = DiffusionGemmaForBlockDiffusion.from_pretrained(sa.model_path, **load_kw)
     model.config.use_cache = False
-    # Text-only SFT: disable the vision bidirectional-attention mask (no image
-    # tokens -> semantic no-op, and its block-mask builder crashes on text).
-    # Multimodal SFT KEEPS it: image tokens must attend bidirectionally.
-    if not sa.multimodal and getattr(model.config.text_config, "use_bidirectional_attention", None) == "vision":
-        model.config.text_config.use_bidirectional_attention = None
     canvas_length = model.config.canvas_length
     vocab_size = model.config.text_config.vocab_size
-    print(f"canvas_length={canvas_length}  vocab_size={vocab_size}  pad_id={pad_id}", flush=True)
+    softcap = model.config.text_config.final_logit_softcapping
+    print(f"canvas_length={canvas_length}  vocab_size={vocab_size}  pad_id={pad_id}  softcap={softcap}", flush=True)
 
+    # ---- LoRA (our MoE-expert mounting; the deliberate departure we keep) ----
     if sa.use_lora and sa.lora_mode == "moe":
-        # Manual MoE-LoRA: adapts the 128 experts (the bulk of the params, where
-        # the reasoning lives) which stock peft cannot reach, plus the decoder
-        # attention. No peft. Saved separately via save_lora_state at the end.
         from moe_lora import apply_moe_and_decoder_lora
-        # train the router whenever the load-balancing loss is on, else it's a no-op
         train_router = sa.train_router or sa.router_aux_loss_coef > 0
         apply_moe_and_decoder_lora(model, r=sa.lora_r, alpha=sa.lora_alpha,
-                                   moe=True, decoder_attn=sa.moe_decoder_attn,
+                                   moe=True, linears=sa.lora_linears,
                                    train_router=train_router)
-        # model-parallel (device_map="auto" shards the 50GB base across GPUs):
-        # mark it so the Trainer uses model-parallel, not DataParallel (which
-        # would replicate the model and double the per-step batch).
         base_dm = getattr(model, "hf_device_map", None)
         if base_dm and len(set(base_dm.values())) > 1:
             model.is_parallelizable = True
             model.model_parallel = True
     elif sa.use_lora:
         from peft import LoraConfig, get_peft_model
-        # "all-linear" -> peft special string; a regex (contains regex chars) ->
-        # pass as a string (peft re.fullmatch's it against module names);
-        # otherwise a comma list of module-name suffixes.
-        if sa.lora_target == "all-linear" or any(c in sa.lora_target for c in r".*()\|["):
-            tgt = sa.lora_target
-        else:
-            tgt = [s for s in sa.lora_target.split(",") if s]
-        lcfg = LoraConfig(
-            r=sa.lora_r, lora_alpha=sa.lora_alpha, lora_dropout=sa.lora_dropout,
-            target_modules=tgt, bias="none", task_type="FEATURE_EXTRACTION",
-        )
-        base_dm = getattr(model, "hf_device_map", None)
+        tgt = sa.lora_target if (sa.lora_target == "all-linear" or
+                                 any(c in sa.lora_target for c in r".*()\|[")) else \
+            [s for s in sa.lora_target.split(",") if s]
+        lcfg = LoraConfig(r=sa.lora_r, lora_alpha=sa.lora_alpha, lora_dropout=sa.lora_dropout,
+                          target_modules=tgt, bias="none", task_type="FEATURE_EXTRACTION")
         model = get_peft_model(model, lcfg)
-        # report encoder/decoder coverage so a mis-mount (e.g. enc-only) is obvious
-        _b = [n for n, _ in model.named_modules() if n.endswith("lora_A")]
-        print(f"LoRA attached: {len(_b)}  enc={sum('encoder' in n for n in _b)} "
-              f"dec={sum('decoder' in n for n in _b)}", flush=True)
         model.print_trainable_parameters()
-        # peft hides hf_device_map; re-expose it so Trainer treats a sharded
-        # (multi-GPU) model as model-parallel and skips the .to(device) move
-        # (which crashes on accelerate-dispatched tensors).
-        if base_dm and len(set(base_dm.values())) > 1:
-            model.hf_device_map = base_dm
-            model.is_parallelizable = True
-            model.model_parallel = True
 
-    # Resolve a data path relative to this file if needed.
+    # ---- data ----
     train_file = sa.train_file
     if not os.path.isabs(train_file):
-        train_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), train_file)
-    if sa.multimodal:
-        ds = MultimodalSFTDataset(train_file, processor, sa.image_path_from,
-                                  sa.image_path_to, sa.max_context_len)
-        collator = MultimodalCollator(canvas_length=canvas_length, pad_token_id=pad_id)
-    else:
-        ds = ChatSFTDataset(train_file, processor, sa.max_context_len)
-        collator = BlockDiffusionCollator(
-            canvas_length=canvas_length, pad_token_id=pad_id,
-            max_context_len=sa.max_context_len, single_block=sa.single_block,
-        )
-    print(f"dataset: {len(ds)} examples ({'multimodal' if sa.multimodal else 'text'})", flush=True)
+        train_file = os.path.join(HERE, train_file)
+    ds = SFTDataset(train_file, processor, sa)
+    collator = DiffusionCollator(pad_token_id=pad_id)
+    print(f"dataset: {len(ds)} examples  format={sa.data_format}  multimodal={sa.multimodal}", flush=True)
 
-    # MoE load-balancing aux loss: hook the decoder routers (works for both moe-LoRA
-    # and full FT; needs the router trainable, handled above for moe mode).
+    # ---- MoE load-balancing aux loss (ours; kept) ----
     router_aux_collector = None
     if sa.router_aux_loss_coef > 0:
         from moe_lora import RouterAuxCollector
         router_aux_collector = RouterAuxCollector(model)
-        print(f"router aux loss ON: coef={sa.router_aux_loss_coef} "
-              f"hooks={len(router_aux_collector.handles)}", flush=True)
+        print(f"router aux loss ON: coef={sa.router_aux_loss_coef} hooks={len(router_aux_collector.handles)}", flush=True)
 
     trainer = DiffusionGemmaSFTTrainer(
         model=model, args=ta, train_dataset=ds, data_collator=collator,
-        vocab_size=vocab_size, eps_t=sa.eps_t, weight_by_t=sa.weight_by_t,
-        self_cond_prob=sa.self_cond_prob, encoder_ar_loss_weight=sa.encoder_ar_loss_weight,
-        pad_token_id=pad_id,
+        vocab_size=vocab_size, canvas_length=canvas_length, eps_t=sa.eps_t,
+        self_cond_prob=sa.self_cond_prob, ar_loss=sa.ar_loss,
+        final_logit_softcapping=softcap, eos_token_id=tok.eos_token_id,
         skip_move=bool(sa.device_map and not using_deepspeed),
         router_aux_collector=router_aux_collector,
         router_aux_loss_coef=sa.router_aux_loss_coef,
@@ -579,7 +449,6 @@ def main():
     trainer.train()
     if not sa.smoke:
         if sa.use_lora and sa.lora_mode == "moe":
-            # save only the LoRA tensors (the 25B base is unchanged on disk)
             from moe_lora import save_lora_state
             os.makedirs(ta.output_dir, exist_ok=True)
             path = os.path.join(ta.output_dir, "moe_lora.pt")
