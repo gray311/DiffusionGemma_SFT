@@ -82,13 +82,28 @@ class ScriptArgs:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    # attention projections are DiffusionGemmaClippableLinear wrapping an inner
-    # nn.Linear named ".linear" — target that so peft can wrap it.
-    lora_target: str = "q_proj.linear,k_proj.linear,v_proj.linear,o_proj.linear"
+    # lora_mode: "peft" -> stock peft on nn.Linear (can't reach MoE experts);
+    #            "moe"  -> manual MoE-LoRA on the 128 experts (88% of params,
+    #                      raw 3D Parameters peft can't touch) + manual LoRA on
+    #                      the decoder attention. Fits one 80GB A100 (~70GB peak).
+    lora_mode: str = "peft"
+    moe_decoder_attn: bool = True   # (moe mode) also LoRA the decoder attention
+    # IMPORTANT (this model is special): encoder attention is wrapped in
+    # Gemma4ClippableLinear (inner ".linear") while DECODER attention is a bare
+    # nn.Linear, and encoder/decoder share weights. Targeting "q_proj.linear"
+    # ONLY hits the encoder (prefill) and misses the decoder denoising path
+    # entirely. Use "all-linear" so peft wraps every nn.Linear on BOTH sides
+    # (enc+dec attention + dense MLP). The 128 MoE experts are raw Parameters
+    # and can't be LoRA'd (need full FT for those).
+    lora_target: str = "all-linear"
     # placement: "" -> load to CPU, Trainer moves to a single GPU (e.g. 80GB H100,
     # where the 52GB model fits). "auto" -> shard across all visible GPUs
     # (model-parallel; needed when no single GPU holds the model, e.g. 4xL40S).
     device_map: str = ""
+    # (model-parallel) per-GPU GiB cap at load time to FORCE the model to split
+    # across GPUs. 0 = use 92% of GPU0 (which leaves the model on one GPU if it
+    # fits). Set e.g. 30 to split the 50GB base ~evenly over 2 GPUs.
+    mp_cap_gib: int = 0
     # attn impl: the sdpa mask builder mishandles this model's sliding+vision
     # bidirectional mask during a training forward (5D-expand crash), so default
     # to eager. Set "sdpa"/"flash_attention_2" once that path is fixed upstream.
@@ -435,7 +450,16 @@ def main():
     if sa.device_map and not using_deepspeed:
         load_kw["device_map"] = sa.device_map
         n = torch.cuda.device_count()
-        per = int(torch.cuda.get_device_properties(0).total_memory / 1e9 * 0.92)
+        # mp_cap_gib > 0: cap per-GPU load budget so the (50GB) model is FORCED to
+        # split across GPUs. Without this, device_map="auto" packs the whole model
+        # onto GPU0 (it fits in 80GB) -> 1 device -> Trainer falls back to
+        # DataParallel (wrong) instead of model-parallel, and one GPU's activation
+        # spike on the heavy 3-image examples OOMs. A low cap leaves the rest of
+        # each GPU free for activations.
+        if sa.mp_cap_gib > 0:
+            per = sa.mp_cap_gib
+        else:
+            per = int(torch.cuda.get_device_properties(0).total_memory / 1e9 * 0.92)
         load_kw["max_memory"] = {i: f"{per}GiB" for i in range(n)}
     model = DiffusionGemmaForBlockDiffusion.from_pretrained(sa.model_path, **load_kw)
     model.config.use_cache = False
@@ -448,15 +472,39 @@ def main():
     vocab_size = model.config.text_config.vocab_size
     print(f"canvas_length={canvas_length}  vocab_size={vocab_size}  pad_id={pad_id}", flush=True)
 
-    if sa.use_lora:
+    if sa.use_lora and sa.lora_mode == "moe":
+        # Manual MoE-LoRA: adapts the 128 experts (the bulk of the params, where
+        # the reasoning lives) which stock peft cannot reach, plus the decoder
+        # attention. No peft. Saved separately via save_lora_state at the end.
+        from moe_lora import apply_moe_and_decoder_lora
+        apply_moe_and_decoder_lora(model, r=sa.lora_r, alpha=sa.lora_alpha,
+                                   moe=True, decoder_attn=sa.moe_decoder_attn)
+        # model-parallel (device_map="auto" shards the 50GB base across GPUs):
+        # mark it so the Trainer uses model-parallel, not DataParallel (which
+        # would replicate the model and double the per-step batch).
+        base_dm = getattr(model, "hf_device_map", None)
+        if base_dm and len(set(base_dm.values())) > 1:
+            model.is_parallelizable = True
+            model.model_parallel = True
+    elif sa.use_lora:
         from peft import LoraConfig, get_peft_model
+        # "all-linear" -> peft special string; a regex (contains regex chars) ->
+        # pass as a string (peft re.fullmatch's it against module names);
+        # otherwise a comma list of module-name suffixes.
+        if sa.lora_target == "all-linear" or any(c in sa.lora_target for c in r".*()\|["):
+            tgt = sa.lora_target
+        else:
+            tgt = [s for s in sa.lora_target.split(",") if s]
         lcfg = LoraConfig(
             r=sa.lora_r, lora_alpha=sa.lora_alpha, lora_dropout=sa.lora_dropout,
-            target_modules=[s for s in sa.lora_target.split(",") if s],
-            bias="none", task_type="FEATURE_EXTRACTION",
+            target_modules=tgt, bias="none", task_type="FEATURE_EXTRACTION",
         )
         base_dm = getattr(model, "hf_device_map", None)
         model = get_peft_model(model, lcfg)
+        # report encoder/decoder coverage so a mis-mount (e.g. enc-only) is obvious
+        _b = [n for n, _ in model.named_modules() if n.endswith("lora_A")]
+        print(f"LoRA attached: {len(_b)}  enc={sum('encoder' in n for n in _b)} "
+              f"dec={sum('decoder' in n for n in _b)}", flush=True)
         model.print_trainable_parameters()
         # peft hides hf_device_map; re-expose it so Trainer treats a sharded
         # (multi-GPU) model as model-parallel and skips the .to(device) move
@@ -491,8 +539,16 @@ def main():
     )
     trainer.train()
     if not sa.smoke:
-        trainer.save_model(ta.output_dir)
-        print(f"saved to {ta.output_dir}", flush=True)
+        if sa.use_lora and sa.lora_mode == "moe":
+            # save only the LoRA tensors (the 25B base is unchanged on disk)
+            from moe_lora import save_lora_state
+            os.makedirs(ta.output_dir, exist_ok=True)
+            path = os.path.join(ta.output_dir, "moe_lora.pt")
+            n = save_lora_state(trainer.model, path)
+            print(f"saved {n} MoE-LoRA tensors to {path}", flush=True)
+        else:
+            trainer.save_model(ta.output_dir)
+            print(f"saved to {ta.output_dir}", flush=True)
 
 
 if __name__ == "__main__":

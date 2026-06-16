@@ -30,8 +30,16 @@ def main():
     tok = proc.tokenizer
     model = DiffusionGemmaForBlockDiffusion.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
     if adapter != "base":
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, adapter).to(dev).eval()
+        import os
+        moe_pt = adapter if adapter.endswith(".pt") else os.path.join(adapter, "moe_lora.pt")
+        if os.path.exists(moe_pt):
+            from moe_lora import apply_moe_and_decoder_lora, load_lora_state
+            apply_moe_and_decoder_lora(model, r=16, alpha=32, moe=True, decoder_attn=True)
+            load_lora_state(model, moe_pt)
+            model = model.eval()
+        else:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, adapter).to(dev).eval()
     vocab = model.config.text_config.vocab_size
 
     ds = MultimodalSFTDataset(data_path, proc, "/weka/home/xliu316/", "/weka/home/ext-yingzima/", 1024)

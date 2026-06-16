@@ -72,9 +72,21 @@ def main():
         MODEL, dtype=torch.bfloat16,
     ).to(dev).eval()
     if adapter != "base":
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, adapter).to(dev).eval()
-        print(f"loaded adapter: {adapter}", flush=True)
+        import os
+        # MoE-LoRA checkpoint (a .pt file or a dir containing moe_lora.pt):
+        # rebuild the adapter structure then load the saved tensors.
+        moe_pt = adapter if adapter.endswith(".pt") else os.path.join(adapter, "moe_lora.pt")
+        if os.path.exists(moe_pt):
+            sys.path.insert(0, "/weka/home/ext-yingzima/DiffusionGemma_SFT")
+            from moe_lora import apply_moe_and_decoder_lora, load_lora_state
+            apply_moe_and_decoder_lora(model, r=16, alpha=32, moe=True, decoder_attn=True)
+            _nt = load_lora_state(model, moe_pt)
+            model = model.eval()
+            print(f"loaded MoE-LoRA ({_nt} tensors): {moe_pt}", flush=True)
+        else:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, adapter).to(dev).eval()
+            print(f"loaded adapter: {adapter}", flush=True)
 
     data = json.load(open(data_path))
     if n:
