@@ -21,6 +21,7 @@ python train_diffusiongemma_sft.py \
   --train_file /weka/home/ext-yingzima/NVIDIA_Internship/data/test.json \
   --multimodal True \
   --use_lora True --lora_mode moe --lora_r 16 --lora_alpha 32 --moe_decoder_attn True \
+  --router_aux_loss_coef ${AUXCOEF:-0} \
   --device_map "$DMAP" --mp_cap_gib ${MPCAP:-0} --attn_implementation ${ATTN:-sdpa} \
   --output_dir "$OUT" \
   --num_train_epochs ${EPOCHS:-5} \

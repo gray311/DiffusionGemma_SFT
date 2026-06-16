@@ -88,6 +88,12 @@ class ScriptArgs:
     #                      the decoder attention. Fits one 80GB A100 (~70GB peak).
     lora_mode: str = "peft"
     moe_decoder_attn: bool = True   # (moe mode) also LoRA the decoder attention
+    # MoE load-balancing (router auxiliary) loss — keeps the router from
+    # collapsing onto a few experts (HF PR #46642). 0 = off (default, matching
+    # the PR). Typical: 1e-2. Only has an effect when the router is trainable:
+    # full FT, or moe-LoRA with --train_router True (auto-enabled when coef>0).
+    router_aux_loss_coef: float = 0.0
+    train_router: bool = False      # (moe mode) unfreeze decoder routers
     # IMPORTANT (this model is special): encoder attention is wrapped in
     # Gemma4ClippableLinear (inner ".linear") while DECODER attention is a bare
     # nn.Linear, and encoder/decoder share weights. Targeting "q_proj.linear"
@@ -310,6 +316,7 @@ class BlockDiffusionCollator:
 def compute_diffusion_loss(model, inputs, *, vocab_size, eps_t=1e-3,
                            weight_by_t=False, self_cond_prob=0.0,
                            encoder_ar_loss_weight=0.0, pad_token_id=0,
+                           router_aux_collector=None, router_aux_loss_coef=0.0,
                            return_outputs=False):
     x0 = inputs["canvas_input_ids"]
     cmask = inputs["canvas_loss_mask"]
@@ -356,6 +363,10 @@ def compute_diffusion_loss(model, inputs, *, vocab_size, eps_t=1e-3,
             with torch.no_grad():
                 sc_logits = model(**fwd).logits.detach()
 
+    # clear any router captures from the no-grad self-conditioning pass so only
+    # the loss-bearing forward's routing contributes to the aux loss.
+    if router_aux_collector is not None:
+        router_aux_collector.reset()
     out = model(self_conditioning_logits=sc_logits, self_conditioning_mask=sc_mask, **fwd)
     logits = out.logits.float()  # (B, L, V)
 
@@ -377,6 +388,14 @@ def compute_diffusion_loss(model, inputs, *, vocab_size, eps_t=1e-3,
         )
         loss = loss + encoder_ar_loss_weight * ar
 
+    # MoE load-balancing auxiliary loss (keeps the router from collapsing onto a
+    # few experts). Only meaningful when the router is trainable (full FT, or
+    # MoE-LoRA with train_router=True). Logged via out for visibility.
+    if router_aux_collector is not None and router_aux_loss_coef > 0:
+        aux = router_aux_collector.aux_loss()
+        if aux is not None:
+            loss = loss + router_aux_loss_coef * aux
+
     return (loss, out) if return_outputs else loss
 
 
@@ -385,7 +404,8 @@ def compute_diffusion_loss(model, inputs, *, vocab_size, eps_t=1e-3,
 # --------------------------------------------------------------------------- #
 class DiffusionGemmaSFTTrainer(Trainer):
     def __init__(self, *a, vocab_size, eps_t, weight_by_t, self_cond_prob,
-                 encoder_ar_loss_weight, pad_token_id, skip_move=False, **kw):
+                 encoder_ar_loss_weight, pad_token_id, skip_move=False,
+                 router_aux_collector=None, router_aux_loss_coef=0.0, **kw):
         self._skip_move = skip_move  # set before super().__init__ (it may move)
         super().__init__(*a, **kw)
         self.vocab_size = vocab_size
@@ -394,6 +414,8 @@ class DiffusionGemmaSFTTrainer(Trainer):
         self.self_cond_prob = self_cond_prob
         self.encoder_ar_loss_weight = encoder_ar_loss_weight
         self.pad_token_id = pad_token_id
+        self.router_aux_collector = router_aux_collector
+        self.router_aux_loss_coef = router_aux_loss_coef
 
     def _move_model_to_device(self, model, device):
         # When the model is sharded across GPUs (device_map), it's already
@@ -407,7 +429,10 @@ class DiffusionGemmaSFTTrainer(Trainer):
             model, inputs, vocab_size=self.vocab_size, eps_t=self.eps_t,
             weight_by_t=self.weight_by_t, self_cond_prob=self.self_cond_prob,
             encoder_ar_loss_weight=self.encoder_ar_loss_weight,
-            pad_token_id=self.pad_token_id, return_outputs=return_outputs,
+            pad_token_id=self.pad_token_id,
+            router_aux_collector=self.router_aux_collector,
+            router_aux_loss_coef=self.router_aux_loss_coef,
+            return_outputs=return_outputs,
         )
 
 
@@ -477,8 +502,11 @@ def main():
         # the reasoning lives) which stock peft cannot reach, plus the decoder
         # attention. No peft. Saved separately via save_lora_state at the end.
         from moe_lora import apply_moe_and_decoder_lora
+        # train the router whenever the load-balancing loss is on, else it's a no-op
+        train_router = sa.train_router or sa.router_aux_loss_coef > 0
         apply_moe_and_decoder_lora(model, r=sa.lora_r, alpha=sa.lora_alpha,
-                                   moe=True, decoder_attn=sa.moe_decoder_attn)
+                                   moe=True, decoder_attn=sa.moe_decoder_attn,
+                                   train_router=train_router)
         # model-parallel (device_map="auto" shards the 50GB base across GPUs):
         # mark it so the Trainer uses model-parallel, not DataParallel (which
         # would replicate the model and double the per-step batch).
@@ -530,12 +558,23 @@ def main():
         )
     print(f"dataset: {len(ds)} examples ({'multimodal' if sa.multimodal else 'text'})", flush=True)
 
+    # MoE load-balancing aux loss: hook the decoder routers (works for both moe-LoRA
+    # and full FT; needs the router trainable, handled above for moe mode).
+    router_aux_collector = None
+    if sa.router_aux_loss_coef > 0:
+        from moe_lora import RouterAuxCollector
+        router_aux_collector = RouterAuxCollector(model)
+        print(f"router aux loss ON: coef={sa.router_aux_loss_coef} "
+              f"hooks={len(router_aux_collector.handles)}", flush=True)
+
     trainer = DiffusionGemmaSFTTrainer(
         model=model, args=ta, train_dataset=ds, data_collator=collator,
         vocab_size=vocab_size, eps_t=sa.eps_t, weight_by_t=sa.weight_by_t,
         self_cond_prob=sa.self_cond_prob, encoder_ar_loss_weight=sa.encoder_ar_loss_weight,
         pad_token_id=pad_id,
         skip_move=bool(sa.device_map and not using_deepspeed),
+        router_aux_collector=router_aux_collector,
+        router_aux_loss_coef=sa.router_aux_loss_coef,
     )
     trainer.train()
     if not sa.smoke:

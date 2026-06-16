@@ -14,7 +14,59 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.integrations.moe import _grouped_linear
+
+
+# --------------------------------------------------------------------------- #
+# MoE load-balancing (router auxiliary) loss.
+#
+# A MoE router can collapse onto a few experts; the switch-transformer aux loss
+# (HF PR #46642, imported-from-mixtral) regularises it toward uniform usage.
+# DiffusionGemma's router returns *softmaxed* probabilities (index 0), so we use
+# them directly (the mixtral func softmaxes raw logits internally — same thing).
+# Scope = the decoder/canvas-denoising routers only, matching the PR.
+#
+# NOTE: this only has an effect when the router params (proj / scale /
+# per_expert_scale) are TRAINABLE. In LoRA mode the router is frozen by default,
+# so pass train_router=True to apply_moe_and_decoder_lora for it to matter.
+# --------------------------------------------------------------------------- #
+def load_balancing_loss(prob_list, num_experts, top_k):
+    """prob_list: list of (T, E) softmaxed router-probability tensors.
+    Returns N * sum_e (f_e * P_e): f_e = frac of tokens with e in top-k,
+    P_e = mean router prob for e. Perfectly-balanced minimum = top_k."""
+    probs = torch.cat([p.reshape(-1, num_experts).float() for p in prob_list], dim=0)  # (T*, E)
+    _, sel = torch.topk(probs, top_k, dim=-1)                  # (T*, K)
+    expert_mask = F.one_hot(sel, num_experts).float()         # (T*, K, E)
+    tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)    # (E,)
+    router_prob_per_expert = probs.mean(dim=0)                # (E,)
+    return num_experts * torch.sum(tokens_per_expert * router_prob_per_expert)
+
+
+class RouterAuxCollector:
+    """Hooks the decoder routers, captures per-forward router probabilities, and
+    computes the load-balancing loss. Call reset() before the loss-bearing
+    forward, then aux_loss() after."""
+    def __init__(self, model):
+        cfg = model.config.text_config
+        self.num_experts = cfg.num_experts
+        self.top_k = cfg.top_k_experts
+        self.buf = []
+        self.handles = []
+        for name, mod in model.named_modules():
+            if "decoder" in name and type(mod).__name__ == "DiffusionGemmaTextRouter":
+                self.handles.append(mod.register_forward_hook(self._hook))
+
+    def _hook(self, mod, inp, out):
+        self.buf.append(out[0])          # router_probabilities (T, E), fp32
+
+    def reset(self):
+        self.buf.clear()
+
+    def aux_loss(self):
+        if not self.buf:
+            return None
+        return load_balancing_loss(self.buf, self.num_experts, self.top_k)
 
 
 # --------------------------------------------------------------------------- #
@@ -116,11 +168,24 @@ def _wrap_decoder_attention(model, r, alpha):
 
 
 # --------------------------------------------------------------------------- #
-def apply_moe_and_decoder_lora(model, r=16, alpha=32, moe=True, decoder_attn=True):
+def _unfreeze_decoder_routers(model):
+    """Make the decoder routers (proj / scale / per_expert_scale) trainable so the
+    load-balancing aux loss has a gradient path. They're tiny (~11M total)."""
+    n = 0
+    for name, mod in model.named_modules():
+        if "decoder" in name and type(mod).__name__ == "DiffusionGemmaTextRouter":
+            for p in mod.parameters():
+                p.requires_grad_(True)
+            n += 1
+    return n
+
+
+def apply_moe_and_decoder_lora(model, r=16, alpha=32, moe=True, decoder_attn=True,
+                               train_router=False):
     # freeze everything first
     for p in model.parameters():
         p.requires_grad_(False)
-    n_moe = n_attn = 0
+    n_moe = n_attn = n_router = 0
     if moe:
         for _, mod in model.named_modules():
             if type(mod).__name__ == "DiffusionGemmaTextExperts":
@@ -128,15 +193,21 @@ def apply_moe_and_decoder_lora(model, r=16, alpha=32, moe=True, decoder_attn=Tru
                 n_moe += 1
     if decoder_attn:
         n_attn = _wrap_decoder_attention(model, r, alpha)
+    if train_router:
+        # so the MoE load-balancing aux loss can actually move the routing
+        n_router = _unfreeze_decoder_routers(model)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"MoE-LoRA: experts={n_moe}  decoder_attn_linears={n_attn}  "
-          f"trainable={trainable/1e6:.1f}M", flush=True)
+          f"routers_trainable={n_router}  trainable={trainable/1e6:.1f}M", flush=True)
     return model
 
 
 def save_lora_state(model, path):
+    # save every trainable tensor: the LoRA adapters plus, if train_router=True,
+    # the (unfrozen) decoder router params. Keyed by name -> loads with strict=False.
+    train_names = {n for n, p in model.named_parameters() if p.requires_grad}
     sd = {k: v for k, v in model.state_dict().items()
-          if (".lora_" in k or "_lora_" in k)}
+          if (k in train_names or ".lora_" in k or "_lora_" in k)}
     torch.save(sd, path)
     return len(sd)
 
