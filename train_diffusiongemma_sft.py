@@ -52,10 +52,12 @@ TRAIN_TEMPLATE_PATH = os.path.join(HERE, "chat_templates", "diffusion_gemma_trai
 class ScriptArgs:
     model_path: str = "/weka/home/ext-yingzima/scratchaszalay1_ssci/yy/huggingface/diffusiongemma-26B-A4B-it"
     train_file: str = "data/example_sft.jsonl"
-    # data_format: "qa" -> {"image":[...], "question":"...<image>...", "answer":"..."}
-    #              "conversations" -> {"image":[...], "conversations":[{from,value}...]}
-    data_format: str = "qa"
+    # data_format: "auto" detects per example; "messages" -> {"messages":[...]};
+    #   "conversations" -> {"conversations":[{from,value}...]}; "qa" ->
+    #   {"question":"...<image>...","answer":"..."}. Image paths in ex["image"].
+    data_format: str = "auto"
     multimodal: bool = False
+    image_seq_tokens: int = 256       # tokens the processor emits per image (fixed)
     # image path resolution: if image_path_from is non-empty and present in a path,
     # replace it with image_path_to; otherwise a RELATIVE path is joined onto
     # image_path_to (treated as a base dir). Absolute paths pass through.
@@ -105,19 +107,29 @@ def _to_messages(ex, data_format, path_from, path_to, max_images=0):
     """Return (messages, image_paths). Last message is the assistant response."""
     fix = lambda p: _resolve_image(p, path_from, path_to)
     cap = lambda lst: lst[:max_images] if max_images > 0 else lst
+    if data_format == "auto":
+        data_format = ("messages" if "messages" in ex
+                       else "conversations" if "conversations" in ex else "qa")
     if data_format == "qa":
         imgs = cap([fix(p) for p in ex.get("image", []) or []])
         qtext = ex["question"].replace("<image>", "").strip()
         answer = ex["answer"]
     elif data_format == "conversations":
-        imgs = [fix(p) for p in ex.get("image", []) or []]
+        imgs = cap([fix(p) for p in ex.get("image", []) or []])
         conv = ex["conversations"]
         # use the prompt up to (and including) the final assistant/gpt turn
         last_gpt = max(i for i, m in enumerate(conv) if m["from"] in ("gpt", "assistant"))
         user_text = "\n".join(m["value"] for m in conv[:last_gpt] if m["from"] in ("human", "user"))
-        user_text = user_text.replace("<image>", "").strip()
+        qtext = user_text.replace("<image>", "").strip()
         answer = conv[last_gpt]["value"]
-        qtext = user_text
+    elif data_format == "messages":
+        imgs = cap([fix(p) for p in ex.get("image", []) or []])
+        msgs = ex["messages"]
+        assert msgs[-1]["role"] == "assistant", "last message must be assistant"
+        qtext = "\n".join(m["content"] for m in msgs[:-1]
+                          if m["role"] in ("user", "system") and isinstance(m["content"], str))
+        qtext = qtext.replace("<image>", "").strip()
+        answer = msgs[-1]["content"]
     else:
         raise ValueError(f"unknown data_format {data_format}")
 
@@ -129,55 +141,70 @@ def _to_messages(ex, data_format, path_from, path_to, max_images=0):
     return messages, imgs
 
 
+def _text_only(messages):
+    """Replace image content dicts with a single <image> placeholder per image."""
+    out = []
+    for m in messages:
+        c = m["content"]
+        if isinstance(c, list):
+            c = "".join("<image>" if it.get("type") == "image" else it.get("text", "") for it in c)
+        out.append({"role": m["role"], "content": c})
+    return out
+
+
 class SFTDataset(Dataset):
     def __init__(self, path, processor, sa: ScriptArgs):
-        self.data = json.load(open(path)) if path.endswith(".json") else \
+        raw = json.load(open(path)) if path.endswith(".json") else \
             [json.loads(l) for l in open(path) if l.strip()]
         if sa.max_examples > 0:
-            self.data = self.data[: sa.max_examples]
+            raw = raw[: sa.max_examples]
         self.processor = processor
         self.tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
         self.sa = sa
         self.train_template = open(TRAIN_TEMPLATE_PATH).read()
-        self.eot_id = self.tok.convert_tokens_to_ids("<end_of_turn>")
+
+        # Precompute the supervised-span length and an estimated full sequence
+        # length, then DROP examples that (a) have no supervised span or (b) don't
+        # fit in max_length. We must not silently right-truncate: the answer is
+        # the suffix, so truncation would delete the labels and train an all-EOS
+        # canvas. (Images are in the user turn, so the assistant-suffix length is
+        # unaffected by image expansion; real seq = text_tokens + n_img*(img_tok-1).)
+        self.items = []
+        n_nospan = n_long = 0
+        for ex in raw:
+            messages, img_paths = _to_messages(ex, sa.data_format, sa.image_path_from,
+                                               sa.image_path_to, sa.max_images)
+            o = self.tok.apply_chat_template(
+                _text_only(messages), chat_template=self.train_template, tokenize=True,
+                return_assistant_tokens_mask=True, return_dict=True,
+            )
+            n_sup = int(sum(o["assistant_masks"]))
+            est_seq = len(o["input_ids"]) + len(img_paths) * (sa.image_seq_tokens - 1)
+            if n_sup == 0:
+                n_nospan += 1
+                continue
+            if est_seq > sa.max_length:
+                n_long += 1
+                continue
+            self.items.append({"messages": messages, "img_paths": img_paths, "n_sup": n_sup})
+        print(f"SFTDataset: kept {len(self.items)}/{len(raw)}  "
+              f"dropped no-span={n_nospan}  dropped >max_length({sa.max_length})={n_long}", flush=True)
 
     def __len__(self):
-        return len(self.data)
-
-    def _n_supervised(self, messages_textonly):
-        """Token count of the supervised suffix (final assistant content + <turn|>),
-        from a text-only render (images count as 1 literal token in the user turn,
-        so the assistant suffix length is unaffected by image expansion)."""
-        out = self.tok.apply_chat_template(
-            messages_textonly, chat_template=self.train_template, tokenize=True,
-            return_assistant_tokens_mask=True, return_dict=True,
-        )
-        return int(sum(out["assistant_masks"]))
+        return len(self.items)
 
     def __getitem__(self, i):
-        sa = self.sa
-        ex = self.data[i]
-        messages, img_paths = _to_messages(ex, sa.data_format, sa.image_path_from, sa.image_path_to)
-
-        # text-only copy (replace image dicts with a placeholder string) for the
-        # supervised-suffix count
-        msgs_txt = []
-        for m in messages:
-            c = m["content"]
-            if isinstance(c, list):
-                c = "".join("<image>" if it.get("type") == "image" else it.get("text", "") for it in c)
-            msgs_txt.append({"role": m["role"], "content": c})
-        n_sup = self._n_supervised(msgs_txt)
-
+        it = self.items[i]
+        messages, img_paths, n_sup = it["messages"], it["img_paths"], it["n_sup"]
         if img_paths:
             from PIL import Image
             imgs = [Image.open(p).convert("RGB") for p in img_paths]
             content = [{"type": "image", "image": im} for im in imgs] + \
                       [{"type": "text", "text": messages[0]["content"][-1]["text"]}]
-            full_msgs = [{"role": "user", "content": content},
-                         {"role": "assistant", "content": messages[1]["content"]}]
+            full = [{"role": "user", "content": content},
+                    {"role": "assistant", "content": messages[1]["content"]}]
             proc = self.processor.apply_chat_template(
-                full_msgs, chat_template=self.train_template, tokenize=True,
+                full, chat_template=self.train_template, tokenize=True,
                 return_dict=True, return_tensors="pt",
             )
             per_image = {"pixel_values", "image_position_ids"}
@@ -190,18 +217,11 @@ class SFTDataset(Dataset):
             item = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
             input_ids = ids
 
-        # labels: supervise only the final assistant span (the suffix of length n_sup)
-        seq_len = input_ids.shape[0]
-        labels = torch.full((seq_len,), -100, dtype=torch.long)
-        if n_sup > 0:
-            labels[-n_sup:] = input_ids[-n_sup:]
+        # supervise only the final assistant span (the suffix of length n_sup).
+        # Pre-filtered to fit, so the span always survives (no truncation here).
+        labels = torch.full((input_ids.shape[0],), -100, dtype=torch.long)
+        labels[-n_sup:] = input_ids[-n_sup:]
         item["labels"] = labels
-
-        # right-truncate to max_length if needed (keeps prompt+images+early answer)
-        if seq_len > sa.max_length:
-            for k in ("input_ids", "attention_mask", "labels", "mm_token_type_ids"):
-                if k in item and torch.is_tensor(item[k]) and item[k].shape[0] == seq_len:
-                    item[k] = item[k][: sa.max_length]
         return item
 
 
