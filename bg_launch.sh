@@ -11,6 +11,7 @@ export DMAP=${DMAP:-}
 export GPUS=${GPUS:-0,1}
 export MPCAP=${MPCAP:-0}
 export OPTIM=${OPTIM:-paged_adamw_8bit}
+export AUXCOEF=${AUXCOEF:-0}
 export PYTHONUNBUFFERED=1
 LOG=${LOG:-logs/train_moe_lora.log}
 
