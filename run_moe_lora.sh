@@ -13,6 +13,8 @@ else
   export CUDA_VISIBLE_DEVICES=${GPU:-0}
 fi
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export WANDB_PROJECT=${WANDB_PROJECT:-diffusiongemma-cot}
+# WANDB_API_KEY is read from the environment (do not hardcode the key here)
 OUT=${OUT:-/weka/home/ext-yingzima/scratchaszalay1_ssci/yy/dgemma_moe_lora}
 
 python train_diffusiongemma_sft.py \
@@ -36,6 +38,7 @@ python train_diffusiongemma_sft.py \
   --warmup_steps 25 \
   --bf16 True --gradient_checkpointing False \
   --optim ${OPTIM:-paged_adamw_8bit} \
-  --logging_steps 10 --save_strategy no --report_to none \
+  --logging_steps 10 --save_strategy no \
+  --report_to ${REPORT:-none} --run_name ${RUNNAME:-dgemma-cot-500} \
   --dataloader_num_workers 2 \
   "$@"

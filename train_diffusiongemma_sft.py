@@ -282,7 +282,7 @@ class DiffusionCollator:
 def compute_diffusion_loss(model, inputs, *, vocab_size, canvas_length, eps_t,
                            self_cond_prob, ar_loss, ar_loss_weight, final_logit_softcapping,
                            eos_token_id, router_aux_collector=None,
-                           router_aux_loss_coef=0.0, return_outputs=False):
+                           router_aux_loss_coef=0.0, metrics=None, return_outputs=False):
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
     labels = inputs["labels"]
@@ -346,6 +346,10 @@ def compute_diffusion_loss(model, inputs, *, vocab_size, canvas_length, eps_t,
     # flat CE over the whole canvas (corrupted and clean alike); no 1/t weighting
     diffusion_loss = F.cross_entropy(outputs.logits.flatten(0, 1).float(), canvas_target.flatten())
     loss = diffusion_loss
+    if metrics is not None:
+        metrics["mdm"] = float(diffusion_loss.detach())
+        metrics["ar"] = 0.0
+        metrics["aux"] = 0.0
 
     # autoregressive co-loss on the encoder (text positions only). Gather the
     # valid positions BEFORE the lm_head so we never materialize a (seq x vocab)
@@ -364,12 +368,16 @@ def compute_diffusion_loss(model, inputs, *, vocab_size, canvas_length, eps_t,
                 enc_logits = torch.tanh(enc_logits / final_logit_softcapping) * final_logit_softcapping
             ar = F.cross_entropy(enc_logits, targets)
             loss = loss + ar_loss_weight * ar
+            if metrics is not None:
+                metrics["ar"] = float(ar.detach())
 
     # MoE load-balancing aux loss (ours; only meaningful with a trainable router)
     if router_aux_collector is not None and router_aux_loss_coef > 0:
         aux = router_aux_collector.aux_loss()
         if aux is not None:
             loss = loss + router_aux_loss_coef * aux
+            if metrics is not None:
+                metrics["aux"] = float(aux.detach())
 
     return (loss, outputs) if return_outputs else loss
 
@@ -391,6 +399,7 @@ class DiffusionGemmaSFTTrainer(Trainer):
         self.eos_token_id = eos_token_id
         self.router_aux_collector = router_aux_collector
         self.router_aux_loss_coef = router_aux_loss_coef
+        self._comp = {"mdm": 0.0, "ar": 0.0, "aux": 0.0, "n": 0}
 
     def _move_model_to_device(self, model, device):
         if self._skip_move:
@@ -398,14 +407,31 @@ class DiffusionGemmaSFTTrainer(Trainer):
         super()._move_model_to_device(model, device)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        return compute_diffusion_loss(
+        m = {}
+        out = compute_diffusion_loss(
             model, inputs, vocab_size=self.vocab_size, canvas_length=self.canvas_length,
             eps_t=self.eps_t, self_cond_prob=self.self_cond_prob, ar_loss=self.ar_loss,
             ar_loss_weight=self.ar_loss_weight,
             final_logit_softcapping=self.final_logit_softcapping, eos_token_id=self.eos_token_id,
             router_aux_collector=self.router_aux_collector,
-            router_aux_loss_coef=self.router_aux_loss_coef, return_outputs=return_outputs,
+            router_aux_loss_coef=self.router_aux_loss_coef, metrics=m, return_outputs=return_outputs,
         )
+        if model.training and m:
+            for k in ("mdm", "ar", "aux"):
+                self._comp[k] += m.get(k, 0.0)
+            self._comp["n"] += 1
+        return out
+
+    def log(self, logs, *args, **kwargs):
+        # inject the per-component losses (mean since the last log) so wandb shows
+        # MDM / AR / AUX separately alongside the total training loss.
+        if self._comp["n"] > 0 and "loss" in logs:
+            n = self._comp["n"]
+            logs["mdm_loss"] = round(self._comp["mdm"] / n, 4)
+            logs["ar_loss"] = round(self._comp["ar"] / n, 4)
+            logs["aux_loss"] = round(self._comp["aux"] / n, 4)
+            self._comp = {"mdm": 0.0, "ar": 0.0, "aux": 0.0, "n": 0}
+        return super().log(logs, *args, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
