@@ -371,10 +371,14 @@ def compute_diffusion_loss(model, inputs, *, vocab_size, canvas_length, eps_t,
             if metrics is not None:
                 metrics["ar"] = float(ar.detach())
 
-    # MoE load-balancing aux loss (ours; only meaningful with a trainable router)
+    # MoE load-balancing aux loss (ours; only meaningful with a trainable router).
+    # The switch loss has a floor of top_k at perfect balance, so we subtract it:
+    # the logged/used value is the EXCESS imbalance (0 = perfectly balanced).
+    # Subtracting a constant doesn't change the gradient -> training is identical.
     if router_aux_collector is not None and router_aux_loss_coef > 0:
         aux = router_aux_collector.aux_loss()
         if aux is not None:
+            aux = aux - router_aux_collector.top_k          # excess over the balanced floor
             loss = loss + router_aux_loss_coef * aux
             if metrics is not None:
                 metrics["aux"] = float(aux.detach())
